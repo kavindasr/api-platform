@@ -151,6 +151,40 @@ func TestJSONFieldNotEqual(t *testing.T) {
 	}
 }
 
+func TestJSONFieldMatchesPattern(t *testing.T) {
+	tests := []struct {
+		name    string
+		pattern string
+		wantErr bool
+	}{
+		{name: "anchored match", pattern: `^\*\*\*[0-9a-f]{5}$`},
+		{name: "context value in the pattern", pattern: `^\*\*\*${CTX:tail}$`},
+		{name: "no match", pattern: `^[0-9]+$`, wantErr: true},
+		{name: "invalid pattern", pattern: `(`, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			local := tcontext.NewLocal("runner")
+			local.Set("tail", "0a1b2")
+			ctx := tcontext.WithLocal(context.Background(), local)
+			require.NoError(t, tcontext.Set(ctx, httpx.ResponseKey,
+				&httpx.Response{Body: []byte(`{"serviceAccount":{"maskedSecret":"***0a1b2"}}`)}))
+
+			err := (&Base{}).jsonFieldMatchesPattern(ctx, "serviceAccount.maskedSecret", tt.pattern)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+	t.Run("absent field", func(t *testing.T) {
+		ctx := tcontext.WithLocal(context.Background(), tcontext.NewLocal("runner"))
+		require.NoError(t, tcontext.Set(ctx, httpx.ResponseKey, &httpx.Response{Body: []byte(`{"a":"b"}`)}))
+		require.Error(t, (&Base{}).jsonFieldMatchesPattern(ctx, "missing", ".*"))
+	})
+}
+
 func TestJSONFieldContainsBefore(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -274,16 +308,31 @@ func TestCanonicalResourceTemplates(t *testing.T) {
 	controlPlaneProtocols := map[string]string{
 		"agent-proxy.yaml": "a2a",
 	}
+	// Control-plane payloads without a protocol block name the fields every request carries.
+	controlPlaneFields := map[string][]string{
+		"service-account.yaml": {"displayName", "roles"},
+	}
 
 	paths, err := filepath.Glob(filepath.Join(root, "*.yaml"))
 	require.NoError(t, err)
-	require.Len(t, paths, len(gatewayKinds)+len(controlPlaneProtocols))
+	require.Len(t, paths, len(gatewayKinds)+len(controlPlaneProtocols)+len(controlPlaneFields))
 	for _, path := range paths {
 		name := filepath.Base(path)
 		content, err := os.ReadFile(path)
 		require.NoError(t, err)
 		var document map[string]any
 		require.NoError(t, yaml.Unmarshal(content, &document))
+
+		if fields, isControlPlane := controlPlaneFields[name]; isControlPlane {
+			for _, envelope := range []string{"apiVersion", "kind", "metadata", "spec"} {
+				require.NotContains(t, document, envelope, "control-plane template %q must not carry a gateway envelope", name)
+			}
+			require.Len(t, document, len(fields), "template %q", name)
+			for _, field := range fields {
+				require.Contains(t, document, field, "template %q", name)
+			}
+			continue
+		}
 
 		if protocol, isControlPlane := controlPlaneProtocols[name]; isControlPlane {
 			require.Equal(t, protocol, document["protocol"], "template %q", name)
@@ -745,10 +794,23 @@ func TestNormalizeErrorResponsePinsRateLimitHeaders(t *testing.T) {
 // TestRESTAPIVersionsFeatureStepsAreDefined resolves the feature's steps without running them,
 // as TestMTLSFeatureStepsAreDefined does, so a typo is caught before a block is provisioned.
 func TestRESTAPIVersionsFeatureStepsAreDefined(t *testing.T) {
+	requireFeatureStepsDefined(t, "features", "apiportal", "core", "rest_api_versions.feature")
+}
+
+// TestServiceAccountsFeatureStepsAreDefined proves every service-account step matches exactly
+// one pattern, so the new steps neither match nothing nor overlap an existing one.
+func TestServiceAccountsFeatureStepsAreDefined(t *testing.T) {
+	requireFeatureStepsDefined(t, "features", "management-portal", "resources", "service_accounts.feature")
+}
+
+// requireFeatureStepsDefined resolves a feature file, named by path elements under the suite
+// root, without running it.
+func requireFeatureStepsDefined(t *testing.T, relative ...string) {
+	t.Helper()
 	_, source, _, ok := runtime.Caller(0)
 	require.True(t, ok)
 	featureRoot := filepath.Join(filepath.Dir(source), "..")
-	path := filepath.Join(featureRoot, "features", "apiportal", "core", "rest_api_versions.feature")
+	path := filepath.Join(append([]string{featureRoot}, relative...)...)
 	_, err := os.Stat(path)
 	require.NoError(t, err)
 

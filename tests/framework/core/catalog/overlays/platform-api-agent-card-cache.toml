@@ -12,3 +12,9 @@ secret = '{{ env "APIP_CP_WEBHOOK_SECRET" }}'
 [platform_api.agent_card_cache]
 positive_ttl = "20s"
 negative_ttl = "8s"
+
+# Service accounts: the /service-accounts routes, /roles, /.well-known/jwks and service-account
+# token verification. With no signing keys configured, tokens are signed with the auth.jwt key
+# pair the framework generates; lifetime and audience stay at their defaults.
+[platform_api.auth.service_account]
+enabled = true

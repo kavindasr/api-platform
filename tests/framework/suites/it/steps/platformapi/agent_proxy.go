@@ -99,10 +99,10 @@ func RegisterAgentProxy(sc *godog.ScenarioContext, s *Steps) {
 		s.pollControlPlaneJSONField)
 	sc.Step(`^I send a "([^"]*)" request to the control plane at "([^"]*)" until the response header "([^"]*)" matches "([^"]*)" with body:$`,
 		s.pollControlPlaneHeader)
-	sc.Step(`^I create an Agent proxy via the control plane from "([^"]*)"(?: as "([^"]*)")? with values:$`,
-		s.createAgentProxyFromTemplate)
-	sc.Step(`^I update the Agent proxy "([^"]*)" via the control plane from "([^"]*)"(?: as "([^"]*)")? with values:$`,
-		s.updateAgentProxyFromTemplate)
+	sc.Step(`^I create (?:an|a) (Agent proxy|service account) via the control plane from "([^"]*)"(?: as "([^"]*)")? with values:$`,
+		s.createFromTemplate)
+	sc.Step(`^I update the (Agent proxy|service account) "([^"]*)" via the control plane from "([^"]*)"(?: as "([^"]*)")? with values:$`,
+		s.updateFromTemplate)
 	sc.Step(`^I deploy the Agent proxy "([^"]*)" to the gateway via the control plane and store the deployment id as "([^"]*)"$`,
 		s.deployAgentProxy)
 	sc.Step(`^I store the registered gateway id as "([^"]*)"$`, s.storeGatewayID)
@@ -140,7 +140,8 @@ func actorCredentials(who string) (actor.Credentials, error) {
 	}
 }
 
-// controlPlaneCall is one publisher-API request made through the funnel.
+// controlPlaneCall is one control-plane request made through the funnel: a signed-in
+// publisher-API call by default.
 type controlPlaneCall struct {
 	method string
 	path   string
@@ -148,6 +149,12 @@ type controlPlaneCall struct {
 	header string
 	value  string
 	body   []byte
+	// contentType is the body's media type; empty means JSON.
+	contentType string
+	// anonymous sends the request without signing in. An anonymous call names no actor.
+	anonymous bool
+	// root resolves path against the server root rather than the versioned management API.
+	root bool
 }
 
 func (s *Steps) sendControlPlaneStep(
@@ -165,8 +172,9 @@ func (s *Steps) sendControlPlaneStep(
 	return err
 }
 
-// sendControlPlane issues one publisher-API request, publishes the response and records any
-// resource the response reports creating or deleting.
+// sendControlPlane issues one control-plane request, publishes the response and records any
+// resource the response reports creating or deleting. It signs in as the named actor unless the
+// call is anonymous.
 func (s *Steps) sendControlPlane(ctx context.Context, call controlPlaneCall) (*httpx.Response, error) {
 	method := strings.ToUpper(strings.TrimSpace(call.method))
 	if method == "" {
@@ -179,31 +187,46 @@ func (s *Steps) sendControlPlane(ctx context.Context, call controlPlaneCall) (*h
 	if !strings.HasPrefix(path, "/") {
 		return nil, fmt.Errorf("control-plane path %q must start with /", path)
 	}
-	credentials, err := actorCredentials(call.who)
-	if err != nil {
-		return nil, err
-	}
 	base, err := s.baseURL()
 	if err != nil {
 		return nil, err
 	}
-	bearer, err := controlplane.ControlPlaneLogin(ctx, base, credentials.Username, credentials.Password)
-	if err != nil {
-		return nil, fmt.Errorf("authenticating to the control plane as %q: %w", credentials.Username, err)
+	headers := map[string]string{}
+	if call.anonymous {
+		if strings.TrimSpace(call.who) != "" {
+			return nil, fmt.Errorf("an anonymous control-plane request cannot be sent as %q", call.who)
+		}
+	} else {
+		credentials, err := actorCredentials(call.who)
+		if err != nil {
+			return nil, err
+		}
+		bearer, err := controlplane.ControlPlaneLogin(ctx, base, credentials.Username, credentials.Password)
+		if err != nil {
+			return nil, fmt.Errorf("authenticating to the control plane as %q: %w", credentials.Username, err)
+		}
+		headers["Authorization"] = "Bearer " + bearer
 	}
-	headers := map[string]string{"Authorization": "Bearer " + bearer}
 	if call.body != nil {
-		headers["Content-Type"] = "application/json"
+		contentType := call.contentType
+		if contentType == "" {
+			contentType = "application/json"
+		}
+		headers["Content-Type"] = contentType
 	}
 	if name := strings.TrimSpace(call.header); name != "" {
 		value, expandErr := stepscommon.Expand(ctx, call.value)
 		if expandErr != nil {
 			return nil, expandErr
 		}
-		headers[name] = value
+		headers[http.CanonicalHeaderKey(name)] = value
+	}
+	prefix := apiBase
+	if call.root {
+		prefix = ""
 	}
 	resp, err := s.funnel.Send(ctx, httpx.Request{
-		Method: method, URL: base + apiBase + path, Headers: headers, Body: call.body,
+		Method: method, URL: base + prefix + path, Headers: headers, Body: call.body,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%s %s: %w", method, path, err)
@@ -530,27 +553,38 @@ func jsonFieldEquals(resp *httpx.Response, field, want string) bool {
 	return ok && fmt.Sprintf("%v", got) == want
 }
 
-func (s *Steps) createAgentProxyFromTemplate(ctx context.Context, templateName, who string, table *godog.Table) error {
-	payload, err := s.renderJSONTemplate(ctx, templateName, table)
-	if err != nil {
-		return err
-	}
-	_, err = s.sendControlPlane(ctx, controlPlaneCall{method: http.MethodPost, path: "/agent-proxies", who: who, body: payload})
-	return err
+// templateCollections maps a resource named in the create and update steps to its collection.
+var templateCollections = map[string]string{
+	"Agent proxy":     "/agent-proxies",
+	"service account": "/service-accounts",
 }
 
-func (s *Steps) updateAgentProxyFromTemplate(ctx context.Context, handle, templateName, who string, table *godog.Table) error {
-	resolved, err := stepscommon.Expand(ctx, handle)
+func (s *Steps) createFromTemplate(ctx context.Context, resource, templateName, who string, table *godog.Table) error {
+	return s.sendTemplate(ctx, http.MethodPost, templateCollections[resource], templateName, who, table)
+}
+
+func (s *Steps) updateFromTemplate(
+	ctx context.Context, resource, id, templateName, who string, table *godog.Table,
+) error {
+	resolved, err := stepscommon.Expand(ctx, id)
 	if err != nil {
 		return err
 	}
+	if strings.TrimSpace(resolved) == "" {
+		return fmt.Errorf("updating a %s needs its id", resource)
+	}
+	return s.sendTemplate(ctx, http.MethodPut, templateCollections[resource]+"/"+url.PathEscape(resolved), templateName, who, table)
+}
+
+// sendTemplate renders a canonical template and sends it through the control-plane funnel.
+func (s *Steps) sendTemplate(
+	ctx context.Context, method, path, templateName, who string, table *godog.Table,
+) error {
 	payload, err := s.renderJSONTemplate(ctx, templateName, table)
 	if err != nil {
 		return err
 	}
-	_, err = s.sendControlPlane(ctx, controlPlaneCall{
-		method: http.MethodPut, path: "/agent-proxies/" + url.PathEscape(resolved), who: who, body: payload,
-	})
+	_, err = s.sendControlPlane(ctx, controlPlaneCall{method: method, path: path, who: who, body: payload})
 	return err
 }
 
