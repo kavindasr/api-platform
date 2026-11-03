@@ -251,6 +251,13 @@ const SubscriptionPlansPage = lazy(() =>
     default: m.SubscriptionPlansPage,
   })),
 );
+const ServiceAccountsPage = lazy(() =>
+  import('../pages/appShell/appShellPages/orgManage/serviceAccounts/ServiceAccountsPage').then(
+    (m) => ({
+      default: m.ServiceAccountsPage,
+    }),
+  ),
+);
 
 export type AppRoutesProps = {
   extensions?: readonly ApiControlPlaneExtension[];
@@ -555,7 +562,8 @@ export function AppRoutes({ extensions = [] }: AppRoutesProps) {
           {scopedRoutes(apiScopedPaths(routes.apiManageLifecycle), <LifeCyclePage />)}
           {scopedRoutes(apiScopedPaths(routes.apiAdmin), <AdminPage />)}
           {/* Organization-level only — platform-api has no project- or API-level
-              subscription-plan or meter endpoint, so these have no scoped routes. */}
+              subscription-plan, meter or service-account endpoint, so these have
+              no scoped routes. */}
           <Route
             path={routes.subscriptionPlans()}
             element={
@@ -569,6 +577,14 @@ export function AppRoutes({ extensions = [] }: AppRoutesProps) {
             element={
               <AppPage>
                 <MetersPage />
+              </AppPage>
+            }
+          />
+          <Route
+            path={routes.serviceAccounts()}
+            element={
+              <AppPage>
+                <ServiceAccountsPage />
               </AppPage>
             }
           />
